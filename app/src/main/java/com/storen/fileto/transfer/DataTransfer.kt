@@ -10,9 +10,13 @@ import kotlinx.coroutines.flow.transform
 import java.io.File
 import java.io.OutputStream
 import java.util.UUID
+import kotlin.math.min
 
 internal const val TRANSFER_DATA_FRAME_SIZE = 1024
-internal const val TRANSFER_FRAME_HEADER_SIZE = 2
+internal const val TRANSFER_FRAME_HEADER_SIZE = 3
+
+internal val TRANSFER_DOWNLOADS_DIR: File get() =
+    Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
 
 interface DataTransfer<T> {
     suspend fun T.send(byteArray: ByteArray): Boolean
@@ -20,100 +24,141 @@ interface DataTransfer<T> {
 }
 
 interface DataFrameProcess {
-    suspend fun ByteArray.packet(isLast: Boolean): ByteArray
-    suspend fun ByteArray.unpack(): Pair<ByteArray, Boolean>
+    suspend fun DataFrame.packet(): ByteArray
+    suspend fun ByteArray.unpack(): DataFrame
+}
+
+data class DataFrame(
+    val data: ByteArray,
+    val type: Int,
+    val isLast: Boolean
+) {
+
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (javaClass != other?.javaClass) return false
+
+        other as DataFrame
+
+        if (!data.contentEquals(other.data)) return false
+        if (type != other.type) return false
+        if (isLast != other.isLast) return false
+
+        return true
+    }
+
+    override fun hashCode(): Int {
+        var result = data.contentHashCode()
+        result = 31 * result + type
+        result = 31 * result + isLast.hashCode()
+        return result
+    }
 }
 
 object DataFrameUtil : DataFrameProcess {
 
     private const val TAG: String = "DataFrameUtil"
 
-    override suspend fun ByteArray.packet(isLast: Boolean): ByteArray {
+    @OptIn(ExperimentalStdlibApi::class)
+    override suspend fun DataFrame.packet(): ByteArray {
         // 构建头部
-        val payloadSize = this.size
-        val header = payloadSize shl 1 or (if (isLast) 0b1 else 0b0)
+        val payloadSize = this.data.size
         val headerBytes = ByteArray(TRANSFER_FRAME_HEADER_SIZE)
-        Log.d(TAG, "buildHeader: header = ${header.toString(2)}")
-        headerBytes[0] = (header shr TRANSFER_FRAME_HEADER_SIZE).toByte()
-        headerBytes[1] = header.toByte()
-        Log.d(TAG, "buildHeader: ${this[0].toString(2)} ${this[1].toString(2)}")
+        headerBytes[0] = (type and 0xFF).toByte()
+        headerBytes[1] = ((payloadSize shr 7) and 0xFF).toByte()
+        headerBytes[2] = ((payloadSize shl 1 or (if (isLast) 0b1 else 0b0)) and 0xFF).toByte()
         // 组装
-        return ByteArray(TRANSFER_FRAME_HEADER_SIZE + payloadSize).apply {
-            headerBytes.copyInto(this, 0, TRANSFER_FRAME_HEADER_SIZE)
-            this@packet.copyInto(this, TRANSFER_FRAME_HEADER_SIZE)
+        val apply = ByteArray(TRANSFER_FRAME_HEADER_SIZE + payloadSize).apply {
+            this[0] = headerBytes[0]
+            this[1] = headerBytes[1]
+            this[2] = headerBytes[2]
+            this@packet.data.copyInto(this, TRANSFER_FRAME_HEADER_SIZE)
         }
+        return apply
     }
 
-    override suspend fun ByteArray.unpack(): Pair<ByteArray, Boolean> {
+    @OptIn(ExperimentalStdlibApi::class)
+    override suspend fun ByteArray.unpack(): DataFrame {
+        if (size <= TRANSFER_FRAME_HEADER_SIZE) {
+            throw RuntimeException("DATA ERROR.")
+        }
         // 解析头部
-        val header = this[0].toInt() shl 8 or this[1].toInt()
-        Log.d(TAG, "unpackData: header = ${header.toString(2)}")
-        val payloadSize = header shr 1
-        val isLast = header and 0x01 == 1
-        Log.d(TAG, "unpackData: payloadSize=$payloadSize isLast=$isLast")
+        val type: Int = this[0].toUByte().toInt()
+        val payloadSize: Int = (((this[1].toUByte().toInt() shl 8) or this[2].toUByte().toInt()) shr 1)
+        val isLast: Boolean = (this[2].toUByte().toInt() and 0x1) == 1
+
+        Log.d(TAG, "unpackData: type=$type payloadSize=$payloadSize isLast=$isLast ${this[2].toUByte().toHexString()}")
         // 截取原始数据
         val bytes = sliceArray(
             TRANSFER_FRAME_HEADER_SIZE until TRANSFER_FRAME_HEADER_SIZE + payloadSize
         )
-        return Pair(bytes, isLast)
+        return DataFrame(bytes, type, isLast)
     }
 }
 
 interface DataSliceProcess {
-    suspend fun <T> slice(source: T): Flow<Pair<ByteArray, Boolean>>
-    suspend fun Flow<Pair<ByteArray, Boolean>>.collectToFile(): Flow<File>
+    suspend fun <T> slice(source: T, type: Int = 1): Flow<DataFrame>
+    suspend fun Flow<DataFrame>.merge(): Flow<Any>
 }
 
 object DataSliceUtil : DataSliceProcess {
 
     private const val TAG: String = "DataSliceUtil"
 
+    private var cachedBytes: MutableList<Byte> = mutableListOf()
+
     private var fileOutStream: OutputStream? = null
 
     private val tempFile: File get() =
-        File(Environment.getDownloadCacheDirectory().absolutePath + "file_transfer.temp")
+        File(TRANSFER_DOWNLOADS_DIR.absolutePath  + File.separator + "file_transfer.temp")
 
     private fun createNewFile(): File =
-        File(Environment.getDownloadCacheDirectory().absolutePath + "${UUID.randomUUID()}.file")
+        File(TRANSFER_DOWNLOADS_DIR.absolutePath + File.separator + "${UUID.randomUUID()}.file")
 
-    override suspend fun <T> slice(source: T): Flow<Pair<ByteArray, Boolean>> {
+    override suspend fun <T> slice(source: T, type: Int): Flow<DataFrame> {
         when (source) {
             is ByteArray ->
-                return source.slice(TRANSFER_DATA_FRAME_SIZE - TRANSFER_FRAME_HEADER_SIZE)
+                return source.slice(TRANSFER_DATA_FRAME_SIZE - TRANSFER_FRAME_HEADER_SIZE, type)
 
             is File ->
-                return source.slice(TRANSFER_DATA_FRAME_SIZE - TRANSFER_FRAME_HEADER_SIZE)
+                return source.slice(TRANSFER_DATA_FRAME_SIZE - TRANSFER_FRAME_HEADER_SIZE, type)
         }
         return emptyFlow()
     }
 
-    override suspend fun Flow<Pair<ByteArray, Boolean>>.collectToFile(): Flow<File> {
-        return transform { it ->
-            if (fileOutStream == null) {
-                fileOutStream = tempFile.outputStream()
-            }
-            fileOutStream?.write(it.first)
-            val isLast = it.second
-            if (isLast) {
-                fileOutStream?.close()
-                val file: File = createNewFile()
-                tempFile.renameTo(file)
-                fileOutStream = null
-                Log.d(TAG, "collectToFile: $file")
-                emit(file)
+    override suspend fun Flow<DataFrame>.merge(): Flow<Any> {
+        return transform {
+            if (it.type == 0) {
+                if (fileOutStream == null) {
+                    Log.d(TAG, "merge: ${tempFile.absolutePath}")
+                    fileOutStream = tempFile.outputStream()
+                }
+                fileOutStream?.write(it.data)
+                if (it.isLast) {
+                    fileOutStream?.close()
+                    val file: File = createNewFile()
+                    tempFile.renameTo(file)
+                    fileOutStream = null
+                    Log.d(TAG, "collectToFile: $file")
+                    emit(file)
+                }
+            } else {
+                cachedBytes.addAll(it.data.toList())
+                if (it.isLast) {
+                    emit(cachedBytes.toByteArray())
+                    cachedBytes.clear()
+                }
             }
         }
     }
 
-    private fun ByteArray.slice(windowSize: Int): Flow<Pair<ByteArray, Boolean>> {
+    private fun ByteArray.slice(windowSize: Int, type: Int): Flow<DataFrame> {
         return callbackFlow {
-            indices.windowed(windowSize, windowSize).let {
+            val wSize = min(windowSize, size)
+            indices.windowed(wSize, wSize).let {
                 it.forEachIndexed { index, ints ->
                     val bytes = sliceArray(ints)
-                    if (!trySend(Pair(bytes, index == it.size - 1)).isSuccess) {
-                        Log.w(TAG, "sliceBytes: trySend failed.")
-                        return@forEachIndexed
-                    }
+                    send(DataFrame(bytes, type,index == it.size - 1))
                 }
             }
             awaitClose {
@@ -122,7 +167,7 @@ object DataSliceUtil : DataSliceProcess {
         }
     }
 
-    private fun File.slice(bufferSize: Int): Flow<Pair<ByteArray, Boolean>> {
+    private fun File.slice(bufferSize: Int, type: Int): Flow<DataFrame> {
         return callbackFlow {
             var buffer = ByteArray(bufferSize)
             val inputStream = inputStream()
@@ -132,10 +177,8 @@ object DataSliceUtil : DataSliceProcess {
                 while (inputStream.buffered(bufferSize).read(buffer)
                         .also { readCount += it } != -1
                 ) {
-                    if (!trySend(Pair(buffer, readCount >= fileLength)).isSuccess) {
-                        Log.w(TAG, "sliceFile: trySend failed.")
-                        break
-                    }
+                    send(DataFrame(buffer, type, readCount >= fileLength))
+                    Log.d(TAG, "slice: success $readCount $fileLength")
                     buffer = ByteArray(bufferSize)
                 }
             }
@@ -155,7 +198,7 @@ object DataSliceUtil : DataSliceProcess {
 
 interface TransferManager {
     suspend fun <T> sendData(data: T)
-    suspend fun receiveDataFlow(): Flow<File>
+    suspend fun receiveDataFlow(): Flow<Any>
 }
 
 

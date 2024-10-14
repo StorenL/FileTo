@@ -51,6 +51,10 @@ object SocketDataTransfer : DataTransfer<Socket> {
         }
     }
 
+    @Volatile
+    private var receiveCount: Int = 0
+
+    @OptIn(ExperimentalStdlibApi::class)
     override suspend fun Socket.receive(): Flow<ByteArray> {
         if (!this.isConnected) {
             Log.i(TAG, "receiveBytes: failed by disconnect.")
@@ -60,12 +64,12 @@ object SocketDataTransfer : DataTransfer<Socket> {
             Log.d(TAG, "receiveBytes: io start.")
             var isActive = true
             getInputStream().let {
-                val buffer = ByteArray(TRANSFER_DATA_FRAME_SIZE)
+                var buffer = ByteArray(TRANSFER_DATA_FRAME_SIZE)
                 var count: Int
                 while (it.read(buffer).also { count = it } != -1 && isActive) {
-                    val success = trySend(buffer).isSuccess
-                    // receiveBytes: 36 3072 3072
-                    Log.d(TAG, "receiveBytes: $count $success")
+                    send(buffer)
+                    buffer = ByteArray(TRANSFER_DATA_FRAME_SIZE)
+                    Log.d(TAG, "receiveBytes: $count")
                 }
             }
             Log.d(TAG, "receiveBytes: io end.")
@@ -122,8 +126,8 @@ internal class SocketServer(
     }
 
     override suspend fun <T> sendData(data: T) {
-        slice(data)
-            .map { it.first.packet(it.second) }
+        slice(data, type = if (data is File) 0 else 1)
+            .map { it.packet() }
             .collect {
                 takeRemoteSocket {
                     send(it)
@@ -131,11 +135,11 @@ internal class SocketServer(
             }
     }
 
-    override suspend fun receiveDataFlow(): Flow<File> {
+    override suspend fun receiveDataFlow(): Flow<Any> {
         return takeRemoteSocket {
             receive()
                 .map { it.unpack() }
-                .collectToFile()
+                .merge()
         } ?: emptyFlow()
     }
 
@@ -143,7 +147,7 @@ internal class SocketServer(
 
 internal class SocketClient(
     private val address: InetAddress,
-    private val post: Int,
+    private val post: Int
 ) : SocketInterface, TransferManager,
     DataSliceProcess by DataSliceUtil,
     DataFrameProcess by DataFrameUtil,
@@ -187,9 +191,13 @@ internal class SocketClient(
         return mRemoteSocket?.block()
     }
 
+    @Volatile
+    private var sendCount: Int = 0
+
+    @OptIn(ExperimentalStdlibApi::class)
     override suspend fun <T> sendData(data: T) {
-        slice(data)
-            .map { it.first.packet(it.second) }
+        slice(data, type = if (data is File) 0 else 1)
+            .map { it.packet() }
             .collect {
                 takeRemoteSocket {
                     send(it)
@@ -197,11 +205,11 @@ internal class SocketClient(
             }
     }
 
-    override suspend fun receiveDataFlow(): Flow<File> {
+    override suspend fun receiveDataFlow(): Flow<Any> {
         return takeRemoteSocket {
             receive()
                 .map { it.unpack() }
-                .collectToFile()
+                .merge()
         } ?: emptyFlow()
     }
 }
