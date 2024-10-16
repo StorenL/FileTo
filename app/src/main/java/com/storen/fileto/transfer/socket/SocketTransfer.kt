@@ -1,4 +1,4 @@
-package com.storen.fileto.socket
+package com.storen.fileto.transfer.socket
 
 import android.util.Log
 import com.storen.fileto.transfer.DataFrameProcess
