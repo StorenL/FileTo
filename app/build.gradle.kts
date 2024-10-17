@@ -51,6 +51,8 @@ android {
 }
 
 dependencies {
+    implementation(libs.gson)
+
     implementation(libs.protobuf.javalite)
 
     implementation(libs.androidx.core.ktx)
